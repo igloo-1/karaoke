@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Karaoke</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <div id="search-screen">
+            <h1>🎤 Karaoke</h1>
+            <div id="search-box">
+                <input type="text" id="search-input" placeholder="Search for a song..." autocomplete="off">
+                <button id="search-btn">Search</button>
+            </div>
+            <div id="results"></div>
+        </div>
+
+        <div id="player-screen" class="hidden">
+            <button id="back-btn">← Back</button>
+            <div id="stage">
+                <div id="video-container">
+                    <div id="youtube-player"></div>
+                </div>
+                <div id="lyrics-overlay">
+                    <div id="lyrics-container">
+                        <div id="lyrics-prev" class="lyrics-line lyrics-dim"></div>
+                        <div id="lyrics-current" class="lyrics-line lyrics-active"></div>
+                        <div id="lyrics-next" class="lyrics-line lyrics-dim"></div>
+                    </div>
+                </div>
+            </div>
+            <div id="controls">
+                <label>
+                    Sync Offset:
+                    <input type="range" id="offset-slider" min="-5" max="5" step="0.1" value="0">
+                    <span id="offset-value">0.0s</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <script src="app.js"></script>
+</body>
+</html>
