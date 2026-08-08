@@ -168,57 +168,19 @@ async function selectSong(lrcItem) {
     }
 }
 
-const FALLBACK_PIPED_INSTANCES = [
-    'https://pipedapi.kavin.rocks',
-    'https://pipedapi.adminforge.de',
-    'https://pipedapi.in.projectsegfau.lt',
-];
-
-async function getPipedInstances() {
-    // Piped mirrors frequently go down or drop CORS support, so pull the
-    // live, CORS-enabled instance list instead of trusting a hardcoded one.
-    try {
-        const resp = await fetch('https://piped-instances.kavin.rocks/');
-        if (!resp.ok) throw new Error(`instance list request failed: ${resp.status}`);
-        const data = await resp.json();
-        const urls = data
-            .filter(inst => inst.cors === 'Yes' || inst.cors === true)
-            .map(inst => inst.api_url)
-            .filter(Boolean);
-        if (urls.length > 0) return urls;
-    } catch (e) {
-        console.warn('Could not fetch live Piped instance list, using fallback:', e);
-    }
-    return FALLBACK_PIPED_INSTANCES;
-}
-
 async function searchYouTube(query) {
-    // Use Piped API (no API key needed)
-    const pipedInstances = await getPipedInstances();
+    // Piped's public mirrors don't reliably allow direct browser (CORS)
+    // access, so the search runs server-side via server.py's /api/search
+    // route and hands back just the video URL.
+    const resp = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+    if (!resp.ok) throw new Error(`Search request failed: ${resp.status}`);
 
-    for (const instance of pipedInstances) {
-        try {
-            const url = `${instance}/search?q=${encodeURIComponent(query)}&filter=videos`;
-            const resp = await fetch(url);
-            if (!resp.ok) continue;
+    const data = await resp.json();
+    if (!data.url) return null;
 
-            const data = await resp.json();
-            const items = data.items || [];
-
-            // Find first video result
-            const video = items.find(i => i.type === 'stream' && i.url);
-            if (video) {
-                // Extract video ID from URL like /watch?v=XXXXX
-                const match = video.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-                if (match) return match[1];
-            }
-        } catch (e) {
-            console.warn(`Piped instance ${instance} failed:`, e);
-            continue;
-        }
-    }
-
-    return null;
+    // Extract video ID from URL like /watch?v=XXXXX
+    const match = data.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+    return match ? match[1] : null;
 }
 
 // ═══════════════════════════════════════════
