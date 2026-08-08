@@ -23,6 +23,7 @@ const resultsDiv = document.getElementById('results');
 const backBtn = document.getElementById('back-btn');
 const offsetSlider = document.getElementById('offset-slider');
 const offsetValue = document.getElementById('offset-value');
+const tapSyncBtn = document.getElementById('tap-sync-btn');
 const lyricsPrev = document.getElementById('lyrics-prev');
 const lyricsCurrent = document.getElementById('lyrics-current');
 const lyricsNext = document.getElementById('lyrics-next');
@@ -147,6 +148,8 @@ async function selectSong(lrcItem) {
     playerScreen.classList.remove('hidden');
 
     // Reset offset
+    offsetSlider.min = -30;
+    offsetSlider.max = 30;
     offsetSlider.value = 0;
     state.syncOffset = 0;
     offsetValue.textContent = '0.0s';
@@ -363,11 +366,30 @@ function clearLyricsDisplay() {
 //  Controls
 // ═══════════════════════════════════════════
 
-offsetSlider.addEventListener('input', () => {
-    state.syncOffset = parseFloat(offsetSlider.value);
-    offsetValue.textContent = state.syncOffset.toFixed(1) + 's';
+function setSyncOffset(offset) {
+    state.syncOffset = offset;
+    if (offset < parseFloat(offsetSlider.min)) offsetSlider.min = Math.floor(offset - 5);
+    if (offset > parseFloat(offsetSlider.max)) offsetSlider.max = Math.ceil(offset + 5);
+    offsetSlider.value = offset;
+    offsetValue.textContent = offset.toFixed(1) + 's';
     // Force re-render
     state.currentLineIndex = -2;
+}
+
+offsetSlider.addEventListener('input', () => {
+    setSyncOffset(parseFloat(offsetSlider.value));
+});
+
+tapSyncBtn.addEventListener('click', () => {
+    if (!state.player || !state.playerReady || state.lyrics.length === 0) return;
+
+    const videoTime = state.player.getCurrentTime();
+    const firstLyricTime = state.lyrics[0].time;
+    setSyncOffset(firstLyricTime - videoTime);
+
+    const originalText = tapSyncBtn.textContent;
+    tapSyncBtn.textContent = 'Synced!';
+    setTimeout(() => { tapSyncBtn.textContent = originalText; }, 1000);
 });
 
 backBtn.addEventListener('click', () => {

@@ -257,7 +257,23 @@ body {
     display: flex;
     justify-content: center;
     align-items: center;
+    gap: 20px;
     padding: 10px 0;
+}
+
+#tap-sync-btn {
+    padding: 8px 18px;
+    border-radius: 20px;
+    border: 1px solid #a855f7;
+    background: transparent;
+    color: #a855f7;
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+
+#tap-sync-btn:hover {
+    background: #a855f7;
+    color: #fff;
 }
 
 #controls label {
