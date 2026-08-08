@@ -206,12 +206,12 @@ async function searchYouTube(query) {
 // ═══════════════════════════════════════════
 
 function parseLRC(lrcText) {
-    const lines = lrcText.split$'\n'$;
+    const lines = lrcText.split('\n');
     const parsed = [];
 
     for (const line of lines) {
         // Match [mm:ss.xx] or [mm:ss.xxx]
-        const match = line.match(/^$$$\d{1,3}$:$\d{2}$\.$\d{2,3}$$$\s*(.*)$/);
+        const match = line.match(/^\[(\d{1,3}):(\d{2})\.(\d{2,3})\]\s*(.*)$/);
         if (match) {
             const minutes = parseInt(match[1]);
             const seconds = parseInt(match[2]);
@@ -306,7 +306,7 @@ function renderLines(currentIdx) {
 }
 
 function renderWordsWithFill(container, text) {
-    const words = text.split$/\s+/$;
+    const words = text.split(/\s+/);
     container.innerHTML = '';
 
     words.forEach((word) => {
