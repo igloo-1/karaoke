@@ -56,12 +56,12 @@ def get_piped_instances():
     return FALLBACK_PIPED_INSTANCES
 
 
-def find_video(query):
+def find_video(instances, query):
     """Search Piped instances for a matching video.
 
-    Returns (instance, video_url, video_id), any of which may be None.
+    Returns (video_url, video_id), either of which may be None.
     """
-    for instance in get_piped_instances():
+    for instance in instances:
         try:
             url = f'{instance}/search?q={urllib.parse.quote(query)}&filter=videos'
             data = fetch_json(url)
@@ -70,11 +70,11 @@ def find_video(query):
                     continue
                 match = VIDEO_ID_RE.search(item['url'])
                 if match:
-                    return instance, item['url'], match.group(1)
+                    return item['url'], match.group(1)
         except (urllib.error.URLError, TimeoutError, ValueError) as e:
-            print(f'Piped instance {instance} failed: {e}')
+            print(f'Piped instance {instance} failed to search: {e}')
             continue
-    return None, None, None
+    return None, None
 
 
 def parse_webvtt(text):
@@ -119,20 +119,29 @@ def find_caption_offset(cues, first_line_text, first_line_time):
     return None
 
 
-def get_suggested_offset(instance, video_id, first_line_text, first_line_time):
-    try:
-        stream_info = fetch_json(f'{instance}/streams/{video_id}')
-        subtitles = stream_info.get('subtitles') or []
-        if not subtitles:
-            return None
-        track = next((s for s in subtitles if str(s.get('code', '')).startswith('en')), subtitles[0])
-        if not track.get('url'):
-            return None
-        cues = parse_webvtt(fetch_text(track['url']))
-        return find_caption_offset(cues, first_line_text, first_line_time)
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
-        print(f'Could not compute caption-based offset: {e}')
-        return None
+def get_suggested_offset(instances, video_id, first_line_text, first_line_time):
+    # Stream/caption extraction breaks on public Piped mirrors far more
+    # often than search does (it's what YouTube's anti-scraping measures
+    # target hardest), even on an instance whose search just worked. So
+    # this retries across all instances rather than reusing just one.
+    for instance in instances:
+        try:
+            stream_info = fetch_json(f'{instance}/streams/{video_id}')
+            subtitles = stream_info.get('subtitles') or []
+            if not subtitles:
+                continue
+            track = next((s for s in subtitles if str(s.get('code', '')).startswith('en')), subtitles[0])
+            if not track.get('url'):
+                continue
+            cues = parse_webvtt(fetch_text(track['url']))
+        except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
+            print(f'Instance {instance} failed to provide captions: {e}')
+            continue
+
+        offset = find_caption_offset(cues, first_line_text, first_line_time)
+        if offset is not None:
+            return offset
+    return None
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -150,7 +159,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(400, 'Missing q parameter')
             return
 
-        instance, video_url, video_id = find_video(query)
+        instances = get_piped_instances()
+        video_url, video_id = find_video(instances, query)
 
         suggested_offset = None
         first_line = params.get('first_line', [''])[0]
@@ -158,7 +168,7 @@ class Handler(SimpleHTTPRequestHandler):
         if video_url and first_line and first_line_time:
             try:
                 suggested_offset = get_suggested_offset(
-                    instance, video_id, first_line, float(first_line_time)
+                    instances, video_id, first_line, float(first_line_time)
                 )
             except ValueError:
                 pass
