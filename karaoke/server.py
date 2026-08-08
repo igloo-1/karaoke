@@ -12,6 +12,7 @@ entirely. Run with: python3 server.py [port]
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +25,11 @@ FALLBACK_PIPED_INSTANCES = [
     'https://pipedapi.in.projectsegfau.lt',
 ]
 REQUEST_TIMEOUT = 8
+# Caption auto-sync is a nice-to-have on top of search, so it gets a smaller
+# per-request timeout and a hard overall budget — it must never make the
+# user wait meaningfully longer for the video to actually start playing.
+CAPTIONS_REQUEST_TIMEOUT = 4
+CAPTIONS_TIME_BUDGET = 12
 VIDEO_ID_RE = re.compile(r'[?&]v=([a-zA-Z0-9_-]{11})')
 WORD_RE = re.compile(r"[a-z0-9']+")
 # Matches WebVTT/SRT cue timestamp lines, with or without an hours component,
@@ -33,15 +39,15 @@ TIMESTAMP_RE = re.compile(
 )
 
 
-def fetch_json(url):
+def fetch_json(url, timeout=REQUEST_TIMEOUT):
     req = urllib.request.Request(url, headers={'User-Agent': 'karaoke-app/1.0'})
-    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
-def fetch_text(url):
+def fetch_text(url, timeout=REQUEST_TIMEOUT):
     req = urllib.request.Request(url, headers={'User-Agent': 'karaoke-app/1.0'})
-    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode('utf-8', errors='replace')
 
 
@@ -123,17 +129,23 @@ def get_suggested_offset(instances, video_id, first_line_text, first_line_time):
     # Stream/caption extraction breaks on public Piped mirrors far more
     # often than search does (it's what YouTube's anti-scraping measures
     # target hardest), even on an instance whose search just worked. So
-    # this retries across all instances rather than reusing just one.
+    # this retries across instances, but under a hard wall-clock budget —
+    # trying every instance at full timeout could take minutes and stall
+    # the video from ever loading.
+    deadline = time.monotonic() + CAPTIONS_TIME_BUDGET
     for instance in instances:
+        if time.monotonic() > deadline:
+            print('Caption auto-sync time budget exceeded, giving up')
+            break
         try:
-            stream_info = fetch_json(f'{instance}/streams/{video_id}')
+            stream_info = fetch_json(f'{instance}/streams/{video_id}', timeout=CAPTIONS_REQUEST_TIMEOUT)
             subtitles = stream_info.get('subtitles') or []
             if not subtitles:
                 continue
             track = next((s for s in subtitles if str(s.get('code', '')).startswith('en')), subtitles[0])
             if not track.get('url'):
                 continue
-            cues = parse_webvtt(fetch_text(track['url']))
+            cues = parse_webvtt(fetch_text(track['url'], timeout=CAPTIONS_REQUEST_TIMEOUT))
         except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
             print(f'Instance {instance} failed to provide captions: {e}')
             continue
