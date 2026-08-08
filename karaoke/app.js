@@ -23,6 +23,7 @@ const resultsDiv = document.getElementById('results');
 const backBtn = document.getElementById('back-btn');
 const offsetSlider = document.getElementById('offset-slider');
 const offsetValue = document.getElementById('offset-value');
+const tapSyncBtn = document.getElementById('tap-sync-btn');
 const lyricsPrev = document.getElementById('lyrics-prev');
 const lyricsCurrent = document.getElementById('lyrics-current');
 const lyricsNext = document.getElementById('lyrics-next');
@@ -147,6 +148,8 @@ async function selectSong(lrcItem) {
     playerScreen.classList.remove('hidden');
 
     // Reset offset
+    offsetSlider.min = -30;
+    offsetSlider.max = 30;
     offsetSlider.value = 0;
     state.syncOffset = 0;
     offsetValue.textContent = '0.0s';
@@ -169,36 +172,18 @@ async function selectSong(lrcItem) {
 }
 
 async function searchYouTube(query) {
-    // Use Piped API (no API key needed)
-    const pipedInstances = [
-        'https://pipedapi.kavin.rocks',
-        'https://pipedapi.adminforge.de',
-        'https://pipedapi.in.projectsegfau.lt',
-    ];
+    // Piped's public mirrors don't reliably allow direct browser (CORS)
+    // access, so the search runs server-side via server.py's /api/search
+    // route and hands back just the video URL.
+    const resp = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+    if (!resp.ok) throw new Error(`Search request failed: ${resp.status}`);
 
-    for (const instance of pipedInstances) {
-        try {
-            const url = `${instance}/search?q=${encodeURIComponent(query)}&filter=videos`;
-            const resp = await fetch(url);
-            if (!resp.ok) continue;
+    const data = await resp.json();
+    if (!data.url) return null;
 
-            const data = await resp.json();
-            const items = data.items || [];
-
-            // Find first video result
-            const video = items.find(i => i.type === 'stream' && i.url);
-            if (video) {
-                // Extract video ID from URL like /watch?v=XXXXX
-                const match = video.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-                if (match) return match[1];
-            }
-        } catch (e) {
-            console.warn(`Piped instance ${instance} failed:`, e);
-            continue;
-        }
-    }
-
-    return null;
+    // Extract video ID from URL like /watch?v=XXXXX
+    const match = data.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+    return match ? match[1] : null;
 }
 
 // ═══════════════════════════════════════════
@@ -381,11 +366,30 @@ function clearLyricsDisplay() {
 //  Controls
 // ═══════════════════════════════════════════
 
-offsetSlider.addEventListener('input', () => {
-    state.syncOffset = parseFloat(offsetSlider.value);
-    offsetValue.textContent = state.syncOffset.toFixed(1) + 's';
+function setSyncOffset(offset) {
+    state.syncOffset = offset;
+    if (offset < parseFloat(offsetSlider.min)) offsetSlider.min = Math.floor(offset - 5);
+    if (offset > parseFloat(offsetSlider.max)) offsetSlider.max = Math.ceil(offset + 5);
+    offsetSlider.value = offset;
+    offsetValue.textContent = offset.toFixed(1) + 's';
     // Force re-render
     state.currentLineIndex = -2;
+}
+
+offsetSlider.addEventListener('input', () => {
+    setSyncOffset(parseFloat(offsetSlider.value));
+});
+
+tapSyncBtn.addEventListener('click', () => {
+    if (!state.player || !state.playerReady || state.lyrics.length === 0) return;
+
+    const videoTime = state.player.getCurrentTime();
+    const firstLyricTime = state.lyrics[0].time;
+    setSyncOffset(firstLyricTime - videoTime);
+
+    const originalText = tapSyncBtn.textContent;
+    tapSyncBtn.textContent = 'Synced!';
+    setTimeout(() => { tapSyncBtn.textContent = originalText; }, 1000);
 });
 
 backBtn.addEventListener('click', () => {
