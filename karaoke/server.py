@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Static file server for the karaoke app, with a same-origin /api/search
-route that proxies the YouTube lookup through Piped server-side.
+route that proxies the YouTube lookup through Piped server-side, and
+optionally auto-detects the lyric sync offset from the matched video's
+captions.
 
 Public Piped mirrors frequently don't send Access-Control-Allow-Origin
 headers, which blocks direct browser fetches. Server-to-server requests
@@ -8,6 +10,7 @@ aren't subject to CORS, so doing the lookup here sidesteps the problem
 entirely. Run with: python3 server.py [port]
 """
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -21,12 +24,25 @@ FALLBACK_PIPED_INSTANCES = [
     'https://pipedapi.in.projectsegfau.lt',
 ]
 REQUEST_TIMEOUT = 8
+VIDEO_ID_RE = re.compile(r'[?&]v=([a-zA-Z0-9_-]{11})')
+WORD_RE = re.compile(r"[a-z0-9']+")
+# Matches WebVTT/SRT cue timestamp lines, with or without an hours component,
+# and with either '.' or ',' as the decimal separator.
+TIMESTAMP_RE = re.compile(
+    r'(?:(\d{2}):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(?:\d{2}:)?\d{2}:\d{2}[.,]\d{3}'
+)
 
 
 def fetch_json(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'karaoke-app/1.0'})
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         return json.loads(resp.read())
+
+
+def fetch_text(url):
+    req = urllib.request.Request(url, headers={'User-Agent': 'karaoke-app/1.0'})
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        return resp.read().decode('utf-8', errors='replace')
 
 
 def get_piped_instances():
@@ -40,18 +56,83 @@ def get_piped_instances():
     return FALLBACK_PIPED_INSTANCES
 
 
-def search_youtube(query):
+def find_video(query):
+    """Search Piped instances for a matching video.
+
+    Returns (instance, video_url, video_id), any of which may be None.
+    """
     for instance in get_piped_instances():
         try:
             url = f'{instance}/search?q={urllib.parse.quote(query)}&filter=videos'
             data = fetch_json(url)
             for item in data.get('items', []):
-                if item.get('type') == 'stream' and item.get('url'):
-                    return item['url']
+                if item.get('type') != 'stream' or not item.get('url'):
+                    continue
+                match = VIDEO_ID_RE.search(item['url'])
+                if match:
+                    return instance, item['url'], match.group(1)
         except (urllib.error.URLError, TimeoutError, ValueError) as e:
             print(f'Piped instance {instance} failed: {e}')
             continue
+    return None, None, None
+
+
+def parse_webvtt(text):
+    """Parse WebVTT/SRT-style caption text into [{'time': seconds, 'text': str}]."""
+    cues = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        match = TIMESTAMP_RE.search(lines[i])
+        if match:
+            hours, minutes, seconds, millis = match.groups()
+            start = (int(hours) if hours else 0) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip():
+                text_lines.append(re.sub(r'<[^>]+>', '', lines[i]).strip())
+                i += 1
+            cue_text = ' '.join(t for t in text_lines if t)
+            if cue_text:
+                cues.append({'time': start, 'text': cue_text})
+        else:
+            i += 1
+    return cues
+
+
+def normalize_words(text):
+    return set(WORD_RE.findall(text.lower()))
+
+
+def find_caption_offset(cues, first_line_text, first_line_time):
+    """Find the first caption cue that shares words with the first lyric
+    line, and return the offset needed to align them, or None."""
+    target_words = normalize_words(first_line_text)
+    if not target_words:
+        return None
+    required_overlap = 2 if len(target_words) >= 2 else 1
+
+    for cue in cues:
+        overlap = target_words & normalize_words(cue['text'])
+        if len(overlap) >= required_overlap:
+            return first_line_time - cue['time']
     return None
+
+
+def get_suggested_offset(instance, video_id, first_line_text, first_line_time):
+    try:
+        stream_info = fetch_json(f'{instance}/streams/{video_id}')
+        subtitles = stream_info.get('subtitles') or []
+        if not subtitles:
+            return None
+        track = next((s for s in subtitles if str(s.get('code', '')).startswith('en')), subtitles[0])
+        if not track.get('url'):
+            return None
+        cues = parse_webvtt(fetch_text(track['url']))
+        return find_caption_offset(cues, first_line_text, first_line_time)
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
+        print(f'Could not compute caption-based offset: {e}')
+        return None
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -69,8 +150,20 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(400, 'Missing q parameter')
             return
 
-        video_url = search_youtube(query)
-        body = json.dumps({'url': video_url}).encode()
+        instance, video_url, video_id = find_video(query)
+
+        suggested_offset = None
+        first_line = params.get('first_line', [''])[0]
+        first_line_time = params.get('first_line_time', [''])[0]
+        if video_url and first_line and first_line_time:
+            try:
+                suggested_offset = get_suggested_offset(
+                    instance, video_id, first_line, float(first_line_time)
+                )
+            except ValueError:
+                pass
+
+        body = json.dumps({'url': video_url, 'suggestedOffset': suggested_offset}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
