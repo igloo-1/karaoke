@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════
 
 const state = {
+    apiReady: false,
     player: null,
     playerReady: false,
     lyrics: [],         // [{time: seconds, text: "..."}, ...]
@@ -42,8 +43,27 @@ const lyricsNext = document.getElementById('lyrics-next');
 //  YouTube IFrame API
 // ═══════════════════════════════════════════
 
-// YouTube API calls this global function when ready
+// YouTube API calls this global function when its JS has loaded. The
+// player itself is created lazily in ensurePlayer(), not here — creating
+// a YT.Player while #player-screen is still display:none (true at this
+// point, on every page load) causes its onReady to intermittently never
+// fire at all, silently, with no console error.
 window.onYouTubeIframeAPIReady = () => {
+    state.apiReady = true;
+};
+
+function ensurePlayer(videoId) {
+    if (state.player && state.playerReady) {
+        state.player.loadVideoById(videoId);
+        return;
+    }
+    if (state.player || !state.apiReady) {
+        // Either already mid-creation (waiting on its onReady) or the
+        // YouTube API script itself hasn't finished loading yet.
+        setTimeout(() => ensurePlayer(videoId), 200);
+        return;
+    }
+
     state.player = new YT.Player('youtube-player', {
         height: '100%',
         width: '100%',
@@ -58,6 +78,7 @@ window.onYouTubeIframeAPIReady = () => {
         events: {
             onReady: () => {
                 state.playerReady = true;
+                state.player.loadVideoById(videoId);
             },
             onStateChange: (e) => {
                 if (e.data === YT.PlayerState.PLAYING) {
@@ -68,7 +89,7 @@ window.onYouTubeIframeAPIReady = () => {
             }
         }
     });
-};
+}
 
 // ═══════════════════════════════════════════
 //  Search
@@ -172,18 +193,9 @@ async function selectSong(lrcItem) {
     // Clear lyrics display
     clearLyricsDisplay();
 
-    // Load video
-    if (state.playerReady) {
-        state.player.loadVideoById(videoId);
-    } else {
-        // Wait for player to be ready
-        const interval = setInterval(() => {
-            if (state.playerReady) {
-                clearInterval(interval);
-                state.player.loadVideoById(videoId);
-            }
-        }, 200);
-    }
+    // Load video. #player-screen is visible by this point (see above),
+    // so it's now safe for ensurePlayer to create the YouTube iframe.
+    ensurePlayer(videoId);
 }
 
 async function searchYouTube(query, firstLine) {
