@@ -170,6 +170,15 @@ body {
     width: 100%;
 }
 
+#stage:fullscreen,
+#stage:-webkit-full-screen {
+    display: flex;
+    align-items: center;
+    width: 100vw;
+    height: 100vh;
+    background: #000;
+}
+
 #video-container {
     position: relative;
     width: 100%;
@@ -177,6 +186,13 @@ body {
     background: #000;
     border-radius: 16px;
     overflow: hidden;
+}
+
+#stage:fullscreen #video-container,
+#stage:-webkit-full-screen #video-container {
+    height: 100%;
+    padding-bottom: 0;
+    border-radius: 0;
 }
 
 #youtube-player {
@@ -251,6 +267,18 @@ body {
     width: 100%;
 }
 
+.lyrics-instrumental {
+    display: inline-block;
+    letter-spacing: 6px;
+    color: rgba(255, 255, 255, 0.5);
+    animation: instrumental-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes instrumental-pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 0.9; }
+}
+
 /* ── Controls ── */
 
 #controls {
@@ -274,6 +302,22 @@ body {
 #tap-sync-btn:hover {
     background: #a855f7;
     color: #fff;
+}
+
+#fullscreen-btn {
+    padding: 8px 18px;
+    border-radius: 20px;
+    border: 1px solid #333;
+    background: transparent;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: color 0.2s, border-color 0.2s;
+}
+
+#fullscreen-btn:hover {
+    color: #fff;
+    border-color: #888;
 }
 
 #controls label {

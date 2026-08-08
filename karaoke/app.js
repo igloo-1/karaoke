@@ -7,9 +7,16 @@ const state = {
     playerReady: false,
     lyrics: [],         // [{time: seconds, text: "..."}, ...]
     currentLineIndex: -1,
+    renderKey: null,    // tracks what's on screen so we only re-render on change
     syncOffset: 0,
     animFrameId: null,
 };
+
+// A gap to the next line longer than this is treated as an instrumental
+// break; INSTRUMENTAL_HOLD is how long the just-sung line stays on screen
+// before the display switches to the instrumental indicator.
+const INSTRUMENTAL_GAP_THRESHOLD = 8;
+const INSTRUMENTAL_HOLD = 5;
 
 // ═══════════════════════════════════════════
 //  DOM refs
@@ -24,6 +31,9 @@ const backBtn = document.getElementById('back-btn');
 const offsetSlider = document.getElementById('offset-slider');
 const offsetValue = document.getElementById('offset-value');
 const tapSyncBtn = document.getElementById('tap-sync-btn');
+const tapSyncDefaultText = tapSyncBtn.textContent;
+const fullscreenBtn = document.getElementById('fullscreen-btn');
+const stageEl = document.getElementById('stage');
 const lyricsPrev = document.getElementById('lyrics-prev');
 const lyricsCurrent = document.getElementById('lyrics-current');
 const lyricsNext = document.getElementById('lyrics-next');
@@ -42,6 +52,8 @@ window.onYouTubeIframeAPIReady = () => {
             controls: 1,
             rel: 0,
             modestbranding: 1,
+            fs: 0, // YouTube's own fullscreen only fullscreens the iframe,
+                   // which hides the lyrics overlay — use our own button instead
         },
         events: {
             onReady: () => {
@@ -126,12 +138,13 @@ async function selectSong(lrcItem) {
     state.lyrics = parseLRC(lrcItem.syncedLyrics);
     state.currentLineIndex = -1;
 
-    // Find YouTube video
+    // Find YouTube video. Pass the first lyric line along so the server can
+    // try to auto-detect the sync offset from the video's own captions.
     const ytQuery = `${lrcItem.trackName} ${lrcItem.artistName} official music video`;
-    let videoId;
+    let videoId, suggestedOffset;
 
     try {
-        videoId = await searchYouTube(ytQuery);
+        ({ videoId, suggestedOffset } = await searchYouTube(ytQuery, state.lyrics[0]));
     } catch (err) {
         console.error('YouTube search failed:', err);
         alert('Could not find a YouTube video for this song.');
@@ -147,12 +160,14 @@ async function selectSong(lrcItem) {
     searchScreen.classList.add('hidden');
     playerScreen.classList.remove('hidden');
 
-    // Reset offset
+    // Reset offset, applying an auto-detected one if captions gave us one
     offsetSlider.min = -30;
     offsetSlider.max = 30;
-    offsetSlider.value = 0;
-    state.syncOffset = 0;
-    offsetValue.textContent = '0.0s';
+    setSyncOffset(Number.isFinite(suggestedOffset) ? suggestedOffset : 0);
+    if (Number.isFinite(suggestedOffset)) {
+        tapSyncBtn.textContent = 'Auto-synced from captions!';
+        setTimeout(() => { tapSyncBtn.textContent = tapSyncDefaultText; }, 2000);
+    }
 
     // Clear lyrics display
     clearLyricsDisplay();
@@ -171,19 +186,28 @@ async function selectSong(lrcItem) {
     }
 }
 
-async function searchYouTube(query) {
+async function searchYouTube(query, firstLine) {
     // Piped's public mirrors don't reliably allow direct browser (CORS)
-    // access, so the search runs server-side via server.py's /api/search
-    // route and hands back just the video URL.
-    const resp = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+    // access, so the search (and caption-based offset lookup) run
+    // server-side via server.py's /api/search route.
+    const params = new URLSearchParams({ q: query });
+    if (firstLine) {
+        params.set('first_line', firstLine.text);
+        params.set('first_line_time', firstLine.time);
+    }
+
+    const resp = await fetch(`/api/search?${params.toString()}`);
     if (!resp.ok) throw new Error(`Search request failed: ${resp.status}`);
 
     const data = await resp.json();
-    if (!data.url) return null;
+    if (!data.url) return { videoId: null, suggestedOffset: null };
 
     // Extract video ID from URL like /watch?v=XXXXX
     const match = data.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-    return match ? match[1] : null;
+    return {
+        videoId: match ? match[1] : null,
+        suggestedOffset: typeof data.suggestedOffset === 'number' ? data.suggestedOffset : null,
+    };
 }
 
 // ═══════════════════════════════════════════
@@ -248,21 +272,44 @@ function updateLyrics() {
         }
     }
 
-    // Only re-render lines if the line changed
-    if (lineIndex !== state.currentLineIndex) {
-        state.currentLineIndex = lineIndex;
-        renderLines(lineIndex);
-    }
-
-    // Update fill animation on current line
-    if (lineIndex >= 0 && lineIndex < state.lyrics.length) {
-        const lineStart = state.lyrics[lineIndex].time;
-        const lineEnd = (lineIndex + 1 < state.lyrics.length)
+    let isInstrumental = false;
+    let lineStart = null;
+    let lineEnd = null;
+    if (lineIndex >= 0) {
+        lineStart = state.lyrics[lineIndex].time;
+        lineEnd = (lineIndex + 1 < state.lyrics.length)
             ? state.lyrics[lineIndex + 1].time
             : lineStart + 5; // assume 5 seconds for last line
 
+        const gapDuration = lineEnd - lineStart;
+        isInstrumental = gapDuration > INSTRUMENTAL_GAP_THRESHOLD
+            && currentTime > lineStart + INSTRUMENTAL_HOLD;
+    }
+
+    // Only re-render when what should be on screen actually changes
+    const renderKey = isInstrumental ? `instrumental:${lineIndex}` : `line:${lineIndex}`;
+    if (renderKey !== state.renderKey) {
+        state.renderKey = renderKey;
+        state.currentLineIndex = lineIndex;
+        if (isInstrumental) {
+            renderInstrumental(lineIndex);
+        } else {
+            renderLines(lineIndex);
+        }
+    }
+
+    // Update fill animation on current line
+    if (!isInstrumental && lineIndex >= 0 && lineIndex < state.lyrics.length) {
         updateFill(lyricsCurrent, currentTime, lineStart, lineEnd);
     }
+}
+
+function renderInstrumental(currentIdx) {
+    lyricsPrev.textContent = currentIdx >= 0 ? state.lyrics[currentIdx].text : '';
+    lyricsCurrent.innerHTML = '<span class="lyrics-instrumental">♪ ♪ ♪</span>';
+    lyricsNext.textContent = (currentIdx + 1 < state.lyrics.length)
+        ? state.lyrics[currentIdx + 1].text
+        : '';
 }
 
 function renderLines(currentIdx) {
@@ -360,6 +407,7 @@ function clearLyricsDisplay() {
     lyricsCurrent.innerHTML = '';
     lyricsNext.textContent = '';
     state.currentLineIndex = -1;
+    state.renderKey = null;
 }
 
 // ═══════════════════════════════════════════
@@ -373,7 +421,7 @@ function setSyncOffset(offset) {
     offsetSlider.value = offset;
     offsetValue.textContent = offset.toFixed(1) + 's';
     // Force re-render
-    state.currentLineIndex = -2;
+    state.renderKey = null;
 }
 
 offsetSlider.addEventListener('input', () => {
@@ -387,9 +435,20 @@ tapSyncBtn.addEventListener('click', () => {
     const firstLyricTime = state.lyrics[0].time;
     setSyncOffset(firstLyricTime - videoTime);
 
-    const originalText = tapSyncBtn.textContent;
     tapSyncBtn.textContent = 'Synced!';
-    setTimeout(() => { tapSyncBtn.textContent = originalText; }, 1000);
+    setTimeout(() => { tapSyncBtn.textContent = tapSyncDefaultText; }, 1000);
+});
+
+fullscreenBtn.addEventListener('click', () => {
+    // Fullscreen the whole stage (video + lyrics overlay), not just the
+    // YouTube iframe, so the lyrics stay visible in fullscreen.
+    if (document.fullscreenElement) {
+        document.exitFullscreen();
+    } else if (stageEl.requestFullscreen) {
+        stageEl.requestFullscreen();
+    } else if (stageEl.webkitRequestFullscreen) {
+        stageEl.webkitRequestFullscreen();
+    }
 });
 
 backBtn.addEventListener('click', () => {
