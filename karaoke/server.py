@@ -12,10 +12,10 @@ entirely. Run with: python3 server.py [port]
 import json
 import re
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 PIPED_INSTANCE_LIST_URL = 'https://piped-instances.kavin.rocks/'
@@ -26,10 +26,9 @@ FALLBACK_PIPED_INSTANCES = [
 ]
 REQUEST_TIMEOUT = 8
 # Caption auto-sync is a nice-to-have on top of search, so it gets a smaller
-# per-request timeout and a hard overall budget — it must never make the
-# user wait meaningfully longer for the video to actually start playing.
+# timeout — it must never make the user wait meaningfully longer for the
+# video to actually start playing.
 CAPTIONS_REQUEST_TIMEOUT = 4
-CAPTIONS_TIME_BUDGET = 12
 VIDEO_ID_RE = re.compile(r'[?&]v=([a-zA-Z0-9_-]{11})')
 WORD_RE = re.compile(r"[a-z0-9']+")
 # Matches WebVTT/SRT cue timestamp lines, with or without an hours component,
@@ -125,43 +124,54 @@ def find_caption_offset(cues, first_line_text, first_line_time):
     return None
 
 
-def get_suggested_offset(instances, video_id, first_line_text, first_line_time):
-    # Stream/caption extraction breaks on public Piped mirrors far more
-    # often than search does (it's what YouTube's anti-scraping measures
-    # target hardest), even on an instance whose search just worked. So
-    # this retries across instances, but under a hard wall-clock budget —
-    # trying every instance at full timeout could take minutes and stall
-    # the video from ever loading.
-    print(f'Caption auto-sync: trying up to {len(instances)} instance(s), budget {CAPTIONS_TIME_BUDGET}s')
-    deadline = time.monotonic() + CAPTIONS_TIME_BUDGET
-    tried = 0
-    for instance in instances:
-        if time.monotonic() > deadline:
-            print(f'Caption auto-sync: time budget exceeded after {tried} instance(s), giving up')
-            break
-        tried += 1
-        try:
-            stream_info = fetch_json(f'{instance}/streams/{video_id}', timeout=CAPTIONS_REQUEST_TIMEOUT)
-            subtitles = stream_info.get('subtitles') or []
-            if not subtitles:
-                print(f'Instance {instance} has no captions for this video')
-                continue
-            track = next((s for s in subtitles if str(s.get('code', '')).startswith('en')), subtitles[0])
-            if not track.get('url'):
-                print(f'Instance {instance} caption track has no url')
-                continue
-            cues = parse_webvtt(fetch_text(track['url'], timeout=CAPTIONS_REQUEST_TIMEOUT))
-        except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
-            print(f'Instance {instance} failed to provide captions: {e}')
-            continue
+def get_youtube_caption_cues(video_id):
+    """Fetch caption cues straight from YouTube's own timedtext endpoint —
+    the same lightweight, key-less endpoint the regular web player uses to
+    show captions — instead of going through a third-party Piped mirror.
 
-        offset = find_caption_offset(cues, first_line_text, first_line_time)
-        if offset is not None:
-            print(f'Instance {instance}: matched cue, offset={offset:.2f}s')
-            return offset
-        print(f'Instance {instance}: got {len(cues)} caption cue(s), none matched the first lyric line')
-    print(f'Caption auto-sync: no match found after trying {tried} instance(s)')
-    return None
+    Piped's /streams endpoint proxies YouTube's *stream extraction*, which
+    is what YouTube's anti-scraping measures target hardest and which kept
+    500ing on every available mirror. Captions don't need any of that: no
+    signature deciphering, no auth. Returns (cues, error_message).
+    """
+    try:
+        list_xml = fetch_text(
+            f'https://www.youtube.com/api/timedtext?type=list&v={video_id}',
+            timeout=CAPTIONS_REQUEST_TIMEOUT,
+        )
+        tracks = ET.fromstring(list_xml).findall('track')
+        if not tracks:
+            return None, 'video has no caption tracks'
+
+        track = next((t for t in tracks if (t.get('lang_code') or '').startswith('en')), tracks[0])
+        params = {'v': video_id, 'lang': track.get('lang_code', ''), 'fmt': 'vtt'}
+        if track.get('kind'):
+            params['kind'] = track.get('kind')
+
+        vtt_text = fetch_text(
+            'https://www.youtube.com/api/timedtext?' + urllib.parse.urlencode(params),
+            timeout=CAPTIONS_REQUEST_TIMEOUT,
+        )
+        cues = parse_webvtt(vtt_text)
+        if not cues:
+            return None, 'caption track was empty'
+        return cues, None
+    except (urllib.error.URLError, TimeoutError, ET.ParseError) as e:
+        return None, str(e)
+
+
+def get_suggested_offset(video_id, first_line_text, first_line_time):
+    cues, error = get_youtube_caption_cues(video_id)
+    if error:
+        print(f'Caption auto-sync: {error}')
+        return None
+
+    offset = find_caption_offset(cues, first_line_text, first_line_time)
+    if offset is not None:
+        print(f'Caption auto-sync: matched cue, offset={offset:.2f}s')
+    else:
+        print(f'Caption auto-sync: got {len(cues)} caption cue(s), none matched the first lyric line')
+    return offset
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -179,17 +189,14 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(400, 'Missing q parameter')
             return
 
-        instances = get_piped_instances()
-        video_url, video_id = find_video(instances, query)
+        video_url, video_id = find_video(get_piped_instances(), query)
 
         suggested_offset = None
         first_line = params.get('first_line', [''])[0]
         first_line_time = params.get('first_line_time', [''])[0]
         if video_url and first_line and first_line_time:
             try:
-                suggested_offset = get_suggested_offset(
-                    instances, video_id, first_line, float(first_line_time)
-                )
+                suggested_offset = get_suggested_offset(video_id, first_line, float(first_line_time))
             except ValueError:
                 pass
 
