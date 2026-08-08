@@ -132,18 +132,23 @@ def get_suggested_offset(instances, video_id, first_line_text, first_line_time):
     # this retries across instances, but under a hard wall-clock budget —
     # trying every instance at full timeout could take minutes and stall
     # the video from ever loading.
+    print(f'Caption auto-sync: trying up to {len(instances)} instance(s), budget {CAPTIONS_TIME_BUDGET}s')
     deadline = time.monotonic() + CAPTIONS_TIME_BUDGET
+    tried = 0
     for instance in instances:
         if time.monotonic() > deadline:
-            print('Caption auto-sync time budget exceeded, giving up')
+            print(f'Caption auto-sync: time budget exceeded after {tried} instance(s), giving up')
             break
+        tried += 1
         try:
             stream_info = fetch_json(f'{instance}/streams/{video_id}', timeout=CAPTIONS_REQUEST_TIMEOUT)
             subtitles = stream_info.get('subtitles') or []
             if not subtitles:
+                print(f'Instance {instance} has no captions for this video')
                 continue
             track = next((s for s in subtitles if str(s.get('code', '')).startswith('en')), subtitles[0])
             if not track.get('url'):
+                print(f'Instance {instance} caption track has no url')
                 continue
             cues = parse_webvtt(fetch_text(track['url'], timeout=CAPTIONS_REQUEST_TIMEOUT))
         except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
@@ -152,7 +157,10 @@ def get_suggested_offset(instances, video_id, first_line_text, first_line_time):
 
         offset = find_caption_offset(cues, first_line_text, first_line_time)
         if offset is not None:
+            print(f'Instance {instance}: matched cue, offset={offset:.2f}s')
             return offset
+        print(f'Instance {instance}: got {len(cues)} caption cue(s), none matched the first lyric line')
+    print(f'Caption auto-sync: no match found after trying {tried} instance(s)')
     return None
 
 
