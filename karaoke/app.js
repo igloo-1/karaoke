@@ -168,13 +168,33 @@ async function selectSong(lrcItem) {
     }
 }
 
+const FALLBACK_PIPED_INSTANCES = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://pipedapi.in.projectsegfau.lt',
+];
+
+async function getPipedInstances() {
+    // Piped mirrors frequently go down or drop CORS support, so pull the
+    // live, CORS-enabled instance list instead of trusting a hardcoded one.
+    try {
+        const resp = await fetch('https://piped-instances.kavin.rocks/');
+        if (!resp.ok) throw new Error(`instance list request failed: ${resp.status}`);
+        const data = await resp.json();
+        const urls = data
+            .filter(inst => inst.cors === 'Yes' || inst.cors === true)
+            .map(inst => inst.api_url)
+            .filter(Boolean);
+        if (urls.length > 0) return urls;
+    } catch (e) {
+        console.warn('Could not fetch live Piped instance list, using fallback:', e);
+    }
+    return FALLBACK_PIPED_INSTANCES;
+}
+
 async function searchYouTube(query) {
     // Use Piped API (no API key needed)
-    const pipedInstances = [
-        'https://pipedapi.kavin.rocks',
-        'https://pipedapi.adminforge.de',
-        'https://pipedapi.in.projectsegfau.lt',
-    ];
+    const pipedInstances = await getPipedInstances();
 
     for (const instance of pipedInstances) {
         try {
