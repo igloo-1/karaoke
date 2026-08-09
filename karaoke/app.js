@@ -49,21 +49,34 @@ const lyricsNext = document.getElementById('lyrics-next');
 // point, on every page load) causes its onReady to intermittently never
 // fire at all, silently, with no console error.
 window.onYouTubeIframeAPIReady = () => {
+    console.log('[karaoke] onYouTubeIframeAPIReady fired');
     state.apiReady = true;
+};
+
+// YouTube embed error codes, for the onError handler below.
+const YT_ERROR_MESSAGES = {
+    2: 'invalid video ID',
+    5: 'HTML5 player error',
+    100: 'video not found or removed',
+    101: 'embedding disabled by video owner',
+    150: 'embedding disabled by video owner',
 };
 
 function ensurePlayer(videoId) {
     if (state.player && state.playerReady) {
+        console.log('[karaoke] ensurePlayer: player already ready, loading', videoId);
         state.player.loadVideoById(videoId);
         return;
     }
     if (state.player || !state.apiReady) {
         // Either already mid-creation (waiting on its onReady) or the
         // YouTube API script itself hasn't finished loading yet.
+        console.log('[karaoke] ensurePlayer: waiting —', { hasPlayer: !!state.player, apiReady: state.apiReady });
         setTimeout(() => ensurePlayer(videoId), 200);
         return;
     }
 
+    console.log('[karaoke] ensurePlayer: creating YT.Player for', videoId);
     state.player = new YT.Player('youtube-player', {
         height: '100%',
         width: '100%',
@@ -77,8 +90,12 @@ function ensurePlayer(videoId) {
         },
         events: {
             onReady: () => {
+                console.log('[karaoke] player onReady fired, loading', videoId);
                 state.playerReady = true;
                 state.player.loadVideoById(videoId);
+            },
+            onError: (e) => {
+                console.error('[karaoke] player onError:', e.data, YT_ERROR_MESSAGES[e.data] || 'unknown');
             },
             onStateChange: (e) => {
                 if (e.data === YT.PlayerState.PLAYING) {
