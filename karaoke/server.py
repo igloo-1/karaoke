@@ -52,14 +52,14 @@ TIMESTAMP_RE = re.compile(
 )
 
 
-def fetch_json(url, timeout=REQUEST_TIMEOUT):
-    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+def fetch_json(url, timeout=REQUEST_TIMEOUT, headers=None):
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
-def fetch_text(url, timeout=REQUEST_TIMEOUT):
-    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+def fetch_text(url, timeout=REQUEST_TIMEOUT, headers=None):
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode('utf-8', errors='replace')
 
@@ -148,10 +148,19 @@ def get_youtube_caption_cues(video_id):
     500ing on every available mirror. Captions don't need any of that: no
     signature deciphering, no auth. Returns (cues, error_message).
     """
+    # A plain User-Agent alone wasn't enough to stop YouTube returning an
+    # empty body; add a Referer pointing at the actual watch page and an
+    # Accept-Language, since some of these endpoints treat a request with
+    # no plausible page-origin as a bot signal.
+    headers = {
+        'Referer': f'https://www.youtube.com/watch?v={video_id}',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
     try:
         list_xml = fetch_text(
             f'https://www.youtube.com/api/timedtext?type=list&v={video_id}',
             timeout=CAPTIONS_REQUEST_TIMEOUT,
+            headers=headers,
         )
         if not list_xml.strip():
             return None, 'caption list request returned an empty response (likely bot-filtered or blocked)'
@@ -167,6 +176,7 @@ def get_youtube_caption_cues(video_id):
         vtt_text = fetch_text(
             'https://www.youtube.com/api/timedtext?' + urllib.parse.urlencode(params),
             timeout=CAPTIONS_REQUEST_TIMEOUT,
+            headers=headers,
         )
         cues = parse_webvtt(vtt_text)
         if not cues:
