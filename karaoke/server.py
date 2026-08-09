@@ -33,6 +33,16 @@ CAPTIONS_REQUEST_TIMEOUT = 4
 # endpoint (likely bot filtering); a realistic browser one does not.
 USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
+# These external services (Piped mirrors, YouTube's timedtext endpoint)
+# occasionally return something other-than-expected — null instead of a
+# list, a dict missing a key, HTML instead of JSON, etc. None of that
+# should ever be able to crash the request handler, so every external
+# call is wrapped in this broad-but-specific set rather than a narrow one
+# that a new shape of garbage response could slip past.
+EXTERNAL_API_ERRORS = (
+    urllib.error.URLError, TimeoutError, ValueError, KeyError,
+    TypeError, AttributeError, IndexError, ET.ParseError,
+)
 VIDEO_ID_RE = re.compile(r'[?&]v=([a-zA-Z0-9_-]{11})')
 WORD_RE = re.compile(r"[a-z0-9']+")
 # Matches WebVTT/SRT cue timestamp lines, with or without an hours component,
@@ -60,7 +70,7 @@ def get_piped_instances():
         urls = [inst['api_url'] for inst in data if inst.get('api_url')]
         if urls:
             return urls
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
+    except EXTERNAL_API_ERRORS as e:
         print(f'Could not fetch live Piped instance list, using fallback: {e}')
     return FALLBACK_PIPED_INSTANCES
 
@@ -80,7 +90,7 @@ def find_video(instances, query):
                 match = VIDEO_ID_RE.search(item['url'])
                 if match:
                     return item['url'], match.group(1)
-        except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        except EXTERNAL_API_ERRORS as e:
             print(f'Piped instance {instance} failed to search: {e}')
             continue
     return None, None
@@ -162,7 +172,7 @@ def get_youtube_caption_cues(video_id):
         if not cues:
             return None, 'caption track was empty'
         return cues, None
-    except (urllib.error.URLError, TimeoutError, ET.ParseError) as e:
+    except EXTERNAL_API_ERRORS as e:
         return None, str(e)
 
 
@@ -195,16 +205,21 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(400, 'Missing q parameter')
             return
 
-        video_url, video_id = find_video(get_piped_instances(), query)
-
+        # No matter what unexpected thing an external service throws at us,
+        # this endpoint must always respond — a crash here means the browser
+        # gets no HTTP response at all (ERR_EMPTY_RESPONSE) and the video
+        # never loads, which is worse than just reporting "not found".
+        video_url = video_id = None
         suggested_offset = None
-        first_line = params.get('first_line', [''])[0]
-        first_line_time = params.get('first_line_time', [''])[0]
-        if video_url and first_line and first_line_time:
-            try:
+        try:
+            video_url, video_id = find_video(get_piped_instances(), query)
+
+            first_line = params.get('first_line', [''])[0]
+            first_line_time = params.get('first_line_time', [''])[0]
+            if video_url and first_line and first_line_time:
                 suggested_offset = get_suggested_offset(video_id, first_line, float(first_line_time))
-            except ValueError:
-                pass
+        except (*EXTERNAL_API_ERRORS, ValueError) as e:
+            print(f'/api/search failed unexpectedly, returning empty result: {e}')
 
         body = json.dumps({'url': video_url, 'suggestedOffset': suggested_offset}).encode()
         self.send_response(200)
