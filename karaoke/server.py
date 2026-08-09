@@ -29,6 +29,10 @@ REQUEST_TIMEOUT = 8
 # timeout — it must never make the user wait meaningfully longer for the
 # video to actually start playing.
 CAPTIONS_REQUEST_TIMEOUT = 4
+# A generic User-Agent gets an empty response from YouTube's timedtext
+# endpoint (likely bot filtering); a realistic browser one does not.
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 VIDEO_ID_RE = re.compile(r'[?&]v=([a-zA-Z0-9_-]{11})')
 WORD_RE = re.compile(r"[a-z0-9']+")
 # Matches WebVTT/SRT cue timestamp lines, with or without an hours component,
@@ -39,13 +43,13 @@ TIMESTAMP_RE = re.compile(
 
 
 def fetch_json(url, timeout=REQUEST_TIMEOUT):
-    req = urllib.request.Request(url, headers={'User-Agent': 'karaoke-app/1.0'})
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
 def fetch_text(url, timeout=REQUEST_TIMEOUT):
-    req = urllib.request.Request(url, headers={'User-Agent': 'karaoke-app/1.0'})
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode('utf-8', errors='replace')
 
@@ -139,6 +143,8 @@ def get_youtube_caption_cues(video_id):
             f'https://www.youtube.com/api/timedtext?type=list&v={video_id}',
             timeout=CAPTIONS_REQUEST_TIMEOUT,
         )
+        if not list_xml.strip():
+            return None, 'caption list request returned an empty response (likely bot-filtered or blocked)'
         tracks = ET.fromstring(list_xml).findall('track')
         if not tracks:
             return None, 'video has no caption tracks'
