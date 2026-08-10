@@ -7,15 +7,22 @@ captions.
 Public Piped mirrors frequently don't send Access-Control-Allow-Origin
 headers, which blocks direct browser fetches. Server-to-server requests
 aren't subject to CORS, so doing the lookup here sidesteps the problem
-entirely. Run with: python3 server.py [port]
+entirely.
+
+Caption auto-sync requires the youtube-transcript-api package:
+    pip install youtube-transcript-api
+It degrades to no-offset (manual tap-to-sync) if that's not installed
+or the lookup fails for any reason — search itself doesn't need it.
+
+Run with: python3 server.py [port]
 """
+import concurrent.futures
 import json
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 PIPED_INSTANCE_LIST_URL = 'https://piped-instances.kavin.rocks/'
@@ -25,43 +32,31 @@ FALLBACK_PIPED_INSTANCES = [
     'https://pipedapi.in.projectsegfau.lt',
 ]
 REQUEST_TIMEOUT = 8
-# Caption auto-sync is a nice-to-have on top of search, so it gets a smaller
-# timeout — it must never make the user wait meaningfully longer for the
-# video to actually start playing.
-CAPTIONS_REQUEST_TIMEOUT = 4
-# A generic User-Agent gets an empty response from YouTube's timedtext
-# endpoint (likely bot filtering); a realistic browser one does not.
+# Caption auto-sync is a nice-to-have on top of search, so it gets its own
+# wall-clock budget — it must never make the user wait meaningfully longer
+# for the video to actually start playing, no matter how the underlying
+# library behaves.
+CAPTIONS_TIMEOUT = 10
 USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
-# These external services (Piped mirrors, YouTube's timedtext endpoint)
-# occasionally return something other-than-expected — null instead of a
-# list, a dict missing a key, HTML instead of JSON, etc. None of that
-# should ever be able to crash the request handler, so every external
-# call is wrapped in this broad-but-specific set rather than a narrow one
-# that a new shape of garbage response could slip past.
+# These external services (Piped mirrors, the transcript library) occasionally
+# return something other-than-expected — null instead of a list, a dict
+# missing a key, etc. None of that should ever be able to crash the request
+# handler, so every external call is wrapped in this broad-but-specific set
+# rather than a narrow one that a new shape of garbage response could slip
+# past.
 EXTERNAL_API_ERRORS = (
     urllib.error.URLError, TimeoutError, ValueError, KeyError,
-    TypeError, AttributeError, IndexError, ET.ParseError,
+    TypeError, AttributeError, IndexError,
 )
 VIDEO_ID_RE = re.compile(r'[?&]v=([a-zA-Z0-9_-]{11})')
 WORD_RE = re.compile(r"[a-z0-9']+")
-# Matches WebVTT/SRT cue timestamp lines, with or without an hours component,
-# and with either '.' or ',' as the decimal separator.
-TIMESTAMP_RE = re.compile(
-    r'(?:(\d{2}):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(?:\d{2}:)?\d{2}:\d{2}[.,]\d{3}'
-)
 
 
-def fetch_json(url, timeout=REQUEST_TIMEOUT, headers=None):
-    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, **(headers or {})})
+def fetch_json(url, timeout=REQUEST_TIMEOUT):
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
-
-
-def fetch_text(url, timeout=REQUEST_TIMEOUT, headers=None):
-    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode('utf-8', errors='replace')
 
 
 def get_piped_instances():
@@ -96,29 +91,6 @@ def find_video(instances, query):
     return None, None
 
 
-def parse_webvtt(text):
-    """Parse WebVTT/SRT-style caption text into [{'time': seconds, 'text': str}]."""
-    cues = []
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        match = TIMESTAMP_RE.search(lines[i])
-        if match:
-            hours, minutes, seconds, millis = match.groups()
-            start = (int(hours) if hours else 0) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
-            i += 1
-            text_lines = []
-            while i < len(lines) and lines[i].strip():
-                text_lines.append(re.sub(r'<[^>]+>', '', lines[i]).strip())
-                i += 1
-            cue_text = ' '.join(t for t in text_lines if t)
-            if cue_text:
-                cues.append({'time': start, 'text': cue_text})
-        else:
-            i += 1
-    return cues
-
-
 def normalize_words(text):
     return set(WORD_RE.findall(text.lower()))
 
@@ -138,52 +110,54 @@ def find_caption_offset(cues, first_line_text, first_line_time):
     return None
 
 
-def get_youtube_caption_cues(video_id):
-    """Fetch caption cues straight from YouTube's own timedtext endpoint —
-    the same lightweight, key-less endpoint the regular web player uses to
-    show captions — instead of going through a third-party Piped mirror.
+def _fetch_transcript_cues(video_id):
+    """Runs in a worker thread — see get_youtube_caption_cues for the
+    timeout wrapper. Only used for timing/word-overlap matching against
+    the already-licensed lyrics text from LRCLIB; the transcript text
+    itself is never shown to the user."""
+    from youtube_transcript_api import YouTubeTranscriptApi
 
-    Piped's /streams endpoint proxies YouTube's *stream extraction*, which
-    is what YouTube's anti-scraping measures target hardest and which kept
-    500ing on every available mirror. Captions don't need any of that: no
-    signature deciphering, no auth. Returns (cues, error_message).
-    """
-    # A plain User-Agent alone wasn't enough to stop YouTube returning an
-    # empty body; add a Referer pointing at the actual watch page and an
-    # Accept-Language, since some of these endpoints treat a request with
-    # no plausible page-origin as a bot signal.
-    headers = {
-        'Referer': f'https://www.youtube.com/watch?v={video_id}',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
     try:
-        list_xml = fetch_text(
-            f'https://www.youtube.com/api/timedtext?type=list&v={video_id}',
-            timeout=CAPTIONS_REQUEST_TIMEOUT,
-            headers=headers,
-        )
-        if not list_xml.strip():
-            return None, 'caption list request returned an empty response (likely bot-filtered or blocked)'
-        tracks = ET.fromstring(list_xml).findall('track')
-        if not tracks:
-            return None, 'video has no caption tracks'
+        # Newer versions of the library are instance-based.
+        fetched = YouTubeTranscriptApi().fetch(video_id, languages=['en', 'en-US', 'en-GB'])
+        return [{'time': s.start, 'text': s.text} for s in fetched]
+    except AttributeError:
+        # Older versions only expose the static method.
+        raw = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
+        return [{'time': item['start'], 'text': item['text']} for item in raw]
 
-        track = next((t for t in tracks if (t.get('lang_code') or '').startswith('en')), tracks[0])
-        params = {'v': video_id, 'lang': track.get('lang_code', ''), 'fmt': 'vtt'}
-        if track.get('kind'):
-            params['kind'] = track.get('kind')
 
-        vtt_text = fetch_text(
-            'https://www.youtube.com/api/timedtext?' + urllib.parse.urlencode(params),
-            timeout=CAPTIONS_REQUEST_TIMEOUT,
-            headers=headers,
-        )
-        cues = parse_webvtt(vtt_text)
-        if not cues:
-            return None, 'caption track was empty'
-        return cues, None
-    except EXTERNAL_API_ERRORS as e:
-        return None, str(e)
+def get_youtube_caption_cues(video_id):
+    """Fetch caption cue timing via the youtube-transcript-api library,
+    which wraps YouTube's internal player API rather than the plain
+    timedtext endpoint we used to hit directly — that got reliably
+    empty-response'd, likely by bot filtering that a User-Agent/Referer
+    alone couldn't get past. Returns (cues, error_message).
+    """
+    try:
+        import youtube_transcript_api  # noqa: F401 (import-availability check)
+    except ImportError:
+        return None, 'youtube-transcript-api not installed — run: pip install youtube-transcript-api'
+
+    # The library manages its own HTTP calls internally with no timeout
+    # exposed, so bound it ourselves — this is a best-effort feature that
+    # must never be able to stall the video from loading.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(_fetch_transcript_cues, video_id)
+    try:
+        cues = future.result(timeout=CAPTIONS_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        return None, f'timed out after {CAPTIONS_TIMEOUT}s'
+    except Exception as e:  # noqa: BLE001 - the library's own exception
+        # hierarchy (TranscriptsDisabled, NoTranscriptFound, etc.) isn't
+        # worth hard-coding; any failure here must degrade gracefully.
+        return None, f'{type(e).__name__}: {e}'
+    finally:
+        pool.shutdown(wait=False)
+
+    if not cues:
+        return None, 'transcript was empty'
+    return cues, None
 
 
 def get_suggested_offset(video_id, first_line_text, first_line_time):
