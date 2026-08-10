@@ -71,6 +71,13 @@ const YT_ERROR_MESSAGES = {
     150: 'embedding disabled by video owner',
 };
 
+// If apiReady never flips true within this long, something is actually
+// wrong (the iframe_api script failed to load or never called back —
+// commonly an ad blocker or extension blocking youtube.com) rather than
+// just being slow, so stop polling silently forever and say so.
+const API_READY_TIMEOUT = 15000;
+let apiReadyWaitStarted = null;
+
 function ensurePlayer(videoId) {
     if (state.player && state.playerReady) {
         console.log('[karaoke] ensurePlayer: player already ready, loading', videoId);
@@ -78,6 +85,30 @@ function ensurePlayer(videoId) {
         return;
     }
     if (state.player || !state.apiReady) {
+        if (window.__youtubeApiScriptFailed) {
+            console.error('[karaoke] The YouTube iframe_api script failed to load (network error). '
+                + 'An ad blocker or browser extension is the most likely cause — try disabling it for this page.');
+            alert('Could not load the YouTube player: the youtube.com script failed to load. '
+                + 'This is usually an ad blocker or extension blocking youtube.com — try disabling it for this page.');
+            apiReadyWaitStarted = null;
+            return;
+        }
+        if (!state.apiReady) {
+            if (apiReadyWaitStarted === null) apiReadyWaitStarted = Date.now();
+            if (Date.now() - apiReadyWaitStarted > API_READY_TIMEOUT) {
+                console.error('[karaoke] Gave up waiting for the YouTube iframe API after '
+                    + `${API_READY_TIMEOUT / 1000}s — onYouTubeIframeAPIReady never fired. `
+                    + 'Check the Network tab for a request to youtube.com/iframe_api and whether '
+                    + 'it succeeded; an ad blocker or extension is the most likely cause.');
+                alert('Could not load the YouTube player after waiting 15 seconds. '
+                    + 'Check your browser console/Network tab for a blocked request to youtube.com — '
+                    + 'an ad blocker or extension is the most likely cause.');
+                apiReadyWaitStarted = null;
+                return;
+            }
+        } else {
+            apiReadyWaitStarted = null;
+        }
         // Either already mid-creation (waiting on its onReady) or the
         // YouTube API script itself hasn't finished loading yet.
         console.log('[karaoke] ensurePlayer: waiting —', { hasPlayer: !!state.player, apiReady: state.apiReady });
