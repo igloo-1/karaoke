@@ -6,7 +6,8 @@ const state = {
     apiReady: false,
     player: null,
     playerReady: false,
-    lyrics: [],         // [{time: seconds, text: "..."}, ...]
+    lyrics: [],         // [{time: seconds, text: "..."}, ...] — from LRCLIB
+    lineTimes: [],      // [{start, end}, ...] parallel to lyrics, in video-timeline seconds
     currentLineIndex: -1,
     renderKey: null,    // tracks what's on screen so we only re-render on change
     syncOffset: 0,
@@ -14,10 +15,18 @@ const state = {
 };
 
 // A gap to the next line longer than this is treated as an instrumental
-// break; INSTRUMENTAL_HOLD is how long the just-sung line stays on screen
-// before the display switches to the instrumental indicator.
+// break; INSTRUMENTAL_HOLD is how long a line stays on screen after its own
+// natural end (not the next line's start) before switching to the
+// instrumental indicator.
 const INSTRUMENTAL_GAP_THRESHOLD = 8;
-const INSTRUMENTAL_HOLD = 5;
+const INSTRUMENTAL_HOLD = 2;
+// Without a caption match, a line's own natural end is a guess — cap it so
+// a long instrumental gap to the next line can't make the fill animation
+// look like it's still "singing" the previous line the whole time.
+const MAX_LINE_FILL_DURATION = 7;
+// Minimum word-overlap (Jaccard) similarity to accept a caption cue as a
+// match for a lyric line, to avoid false positives on generic words.
+const MIN_CAPTION_MATCH_SCORE = 0.34;
 
 // ═══════════════════════════════════════════
 //  DOM refs
@@ -172,17 +181,19 @@ async function searchLRCLIB(query) {
 // ═══════════════════════════════════════════
 
 async function selectSong(lrcItem) {
-    // Parse synced lyrics
+    // Parse synced lyrics, and set up fallback line timings immediately
+    // (pure LRC-relative) so the lyrics display works right away — these
+    // get replaced with caption-anchored timings below if that succeeds,
+    // but that must never block the video from loading.
     state.lyrics = parseLRC(lrcItem.syncedLyrics);
+    state.lineTimes = computeFallbackLineTimes(state.lyrics);
     state.currentLineIndex = -1;
 
-    // Find YouTube video. Pass the first lyric line along so the server can
-    // try to auto-detect the sync offset from the video's own captions.
     const ytQuery = `${lrcItem.trackName} ${lrcItem.artistName} official music video`;
-    let videoId, suggestedOffset;
+    let videoId;
 
     try {
-        ({ videoId, suggestedOffset } = await searchYouTube(ytQuery, state.lyrics[0]));
+        videoId = await searchYouTube(ytQuery);
     } catch (err) {
         console.error('YouTube search failed:', err);
         alert('Could not find a YouTube video for this song.');
@@ -198,14 +209,9 @@ async function selectSong(lrcItem) {
     searchScreen.classList.add('hidden');
     playerScreen.classList.remove('hidden');
 
-    // Reset offset, applying an auto-detected one if captions gave us one
     offsetSlider.min = -30;
     offsetSlider.max = 30;
-    setSyncOffset(Number.isFinite(suggestedOffset) ? suggestedOffset : 0);
-    if (Number.isFinite(suggestedOffset)) {
-        tapSyncBtn.textContent = 'Auto-synced from captions!';
-        setTimeout(() => { tapSyncBtn.textContent = tapSyncDefaultText; }, 2000);
-    }
+    setSyncOffset(0);
 
     // Clear lyrics display
     clearLyricsDisplay();
@@ -213,30 +219,151 @@ async function selectSong(lrcItem) {
     // Load video. #player-screen is visible by this point (see above),
     // so it's now safe for ensurePlayer to create the YouTube iframe.
     ensurePlayer(videoId);
+
+    // Best-effort: refine line timings from the video's own captions once
+    // they're fetched. Runs after the video is already loading so it can
+    // never delay playback.
+    alignToCaptions(videoId);
 }
 
-async function searchYouTube(query, firstLine) {
-    // Piped's public mirrors don't reliably allow direct browser (CORS)
-    // access, so the search (and caption-based offset lookup) run
-    // server-side via server.py's /api/search route.
-    const params = new URLSearchParams({ q: query });
-    if (firstLine) {
-        params.set('first_line', firstLine.text);
-        params.set('first_line_time', firstLine.time);
-    }
-
-    const resp = await fetch(`/api/search?${params.toString()}`);
+async function searchYouTube(query) {
+    // yt-dlp runs server-side (server.py's /api/search route) since it's a
+    // Python library, not something the browser can call directly.
+    const resp = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
     if (!resp.ok) throw new Error(`Search request failed: ${resp.status}`);
 
     const data = await resp.json();
-    if (!data.url) return { videoId: null, suggestedOffset: null };
+    if (!data.url) return null;
 
     // Extract video ID from URL like /watch?v=XXXXX
     const match = data.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-    return {
-        videoId: match ? match[1] : null,
-        suggestedOffset: typeof data.suggestedOffset === 'number' ? data.suggestedOffset : null,
-    };
+    return match ? match[1] : null;
+}
+
+// ═══════════════════════════════════════════
+//  Caption-based per-line sync
+// ═══════════════════════════════════════════
+
+function normalizeWords(text) {
+    const matches = text.toLowerCase().match(/[a-z0-9']+/g);
+    return matches ? new Set(matches) : new Set();
+}
+
+function wordOverlapScore(wordsA, wordsB) {
+    if (wordsA.size === 0 || wordsB.size === 0) return 0;
+    let intersection = 0;
+    for (const w of wordsA) {
+        if (wordsB.has(w)) intersection++;
+    }
+    const union = wordsA.size + wordsB.size - intersection;
+    return intersection / union; // Jaccard similarity
+}
+
+// For each lyric line, find the caption cue with the closest wording
+// (highest word-overlap score), keeping it only if the score clears a
+// minimum confidence bar and it doesn't jump backwards in time relative
+// to the previous accepted match (more likely a false positive than a
+// real reordering).
+function alignLyricsToCaptions(lyrics, cues) {
+    const sortedCues = [...cues].sort((a, b) => a.start - b.start);
+    const cueWordSets = sortedCues.map(c => normalizeWords(c.text));
+
+    const aligned = new Array(lyrics.length).fill(null);
+    let lastStart = -Infinity;
+
+    lyrics.forEach((line, i) => {
+        const lineWords = normalizeWords(line.text);
+        let bestIdx = -1;
+        let bestScore = 0;
+        for (let c = 0; c < sortedCues.length; c++) {
+            const score = wordOverlapScore(lineWords, cueWordSets[c]);
+            if (score > bestScore) {
+                bestScore = score;
+                bestIdx = c;
+            }
+        }
+        if (bestIdx === -1 || bestScore < MIN_CAPTION_MATCH_SCORE) return;
+
+        const cue = sortedCues[bestIdx];
+        if (cue.start >= lastStart) {
+            aligned[i] = { start: cue.start, end: cue.end };
+            lastStart = cue.start;
+        }
+    });
+
+    return aligned;
+}
+
+// Builds the final {start, end} video-timeline timing for every lyric
+// line: matched lines use their cue's real timing directly; unmatched
+// lines are interpolated between the nearest matched neighbors (or
+// extrapolated from the nearest single match), so one bad match doesn't
+// leave a whole stretch of lines unsynced.
+function computeLineTimesFromCaptions(lyrics, cues) {
+    const aligned = alignLyricsToCaptions(lyrics, cues);
+    const anchors = [];
+    aligned.forEach((m, i) => { if (m) anchors.push(i); });
+    if (anchors.length === 0) return null;
+
+    const fallbackOffset = aligned[anchors[0]].start - lyrics[anchors[0]].time;
+
+    function estimatedStart(i) {
+        let prev = null, next = null;
+        for (const idx of anchors) {
+            if (idx <= i) prev = idx;
+            if (idx >= i && next === null) next = idx;
+        }
+        if (prev !== null && next !== null && prev !== next) {
+            const t = (lyrics[i].time - lyrics[prev].time) / (lyrics[next].time - lyrics[prev].time);
+            return aligned[prev].start + t * (aligned[next].start - aligned[prev].start);
+        }
+        if (prev !== null) return aligned[prev].start + (lyrics[i].time - lyrics[prev].time);
+        if (next !== null) return aligned[next].start - (lyrics[next].time - lyrics[i].time);
+        return lyrics[i].time + fallbackOffset;
+    }
+
+    const starts = lyrics.map((line, i) => (aligned[i] ? aligned[i].start : estimatedStart(i)));
+
+    return lyrics.map((line, i) => {
+        const nextStart = (i + 1 < lyrics.length) ? starts[i + 1] : starts[i] + 5;
+        const end = aligned[i]
+            ? aligned[i].end
+            : Math.min(nextStart, starts[i] + MAX_LINE_FILL_DURATION);
+        return { start: starts[i], end };
+    });
+}
+
+// Pure LRC-relative timings, used immediately on song load and as the
+// permanent fallback if captions never resolve or nothing matches.
+function computeFallbackLineTimes(lyrics) {
+    return lyrics.map((line, i) => {
+        const nextStart = (i + 1 < lyrics.length) ? lyrics[i + 1].time : line.time + 5;
+        const end = Math.min(nextStart, line.time + MAX_LINE_FILL_DURATION);
+        return { start: line.time, end };
+    });
+}
+
+async function alignToCaptions(videoId) {
+    let cues;
+    try {
+        const resp = await fetch(`/api/captions?v=${encodeURIComponent(videoId)}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        cues = data.cues;
+    } catch (err) {
+        console.warn('Caption fetch failed:', err);
+        return;
+    }
+    if (!cues || cues.length === 0) return;
+
+    const lineTimes = computeLineTimesFromCaptions(state.lyrics, cues);
+    if (!lineTimes) return; // nothing matched with enough confidence
+
+    state.lineTimes = lineTimes;
+    state.renderKey = null; // force re-render with the refined timings
+
+    tapSyncBtn.textContent = 'Auto-synced from captions!';
+    setTimeout(() => { tapSyncBtn.textContent = tapSyncDefaultText; }, 2000);
 }
 
 // ═══════════════════════════════════════════
@@ -292,10 +419,10 @@ function updateLyrics() {
 
     const currentTime = state.player.getCurrentTime() + state.syncOffset;
 
-    // Find current line index
+    // Find current line index (by each line's own start on the video timeline)
     let lineIndex = -1;
-    for (let i = state.lyrics.length - 1; i >= 0; i--) {
-        if (currentTime >= state.lyrics[i].time) {
+    for (let i = state.lineTimes.length - 1; i >= 0; i--) {
+        if (currentTime >= state.lineTimes[i].start) {
             lineIndex = i;
             break;
         }
@@ -303,16 +430,21 @@ function updateLyrics() {
 
     let isInstrumental = false;
     let lineStart = null;
-    let lineEnd = null;
+    let lineNaturalEnd = null;
     if (lineIndex >= 0) {
-        lineStart = state.lyrics[lineIndex].time;
-        lineEnd = (lineIndex + 1 < state.lyrics.length)
-            ? state.lyrics[lineIndex + 1].time
+        const lt = state.lineTimes[lineIndex];
+        lineStart = lt.start;
+        lineNaturalEnd = lt.end;
+        const nextLineStart = (lineIndex + 1 < state.lineTimes.length)
+            ? state.lineTimes[lineIndex + 1].start
             : lineStart + 5; // assume 5 seconds for last line
 
-        const gapDuration = lineEnd - lineStart;
+        // Instrumental gap is measured to the *next line's start*, decoupled
+        // from this line's own (usually much shorter) natural end — a caption
+        // match means lineNaturalEnd no longer stretches across the gap.
+        const gapDuration = nextLineStart - lineStart;
         isInstrumental = gapDuration > INSTRUMENTAL_GAP_THRESHOLD
-            && currentTime > lineStart + INSTRUMENTAL_HOLD;
+            && currentTime > lineNaturalEnd + INSTRUMENTAL_HOLD;
     }
 
     // Only re-render when what should be on screen actually changes
@@ -327,9 +459,10 @@ function updateLyrics() {
         }
     }
 
-    // Update fill animation on current line
+    // Update fill animation on current line — capped at its own natural end,
+    // so it finishes at a sensible pace instead of creeping across a gap.
     if (!isInstrumental && lineIndex >= 0 && lineIndex < state.lyrics.length) {
-        updateFill(lyricsCurrent, currentTime, lineStart, lineEnd);
+        updateFill(lyricsCurrent, currentTime, lineStart, lineNaturalEnd);
     }
 }
 
@@ -458,11 +591,11 @@ offsetSlider.addEventListener('input', () => {
 });
 
 tapSyncBtn.addEventListener('click', () => {
-    if (!state.player || !state.playerReady || state.lyrics.length === 0) return;
+    if (!state.player || !state.playerReady || state.lineTimes.length === 0) return;
 
     const videoTime = state.player.getCurrentTime();
-    const firstLyricTime = state.lyrics[0].time;
-    setSyncOffset(firstLyricTime - videoTime);
+    const firstLineStart = state.lineTimes[0].start;
+    setSyncOffset(firstLineStart - videoTime);
 
     tapSyncBtn.textContent = 'Synced!';
     setTimeout(() => { tapSyncBtn.textContent = tapSyncDefaultText; }, 1000);

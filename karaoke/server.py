@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Static file server for the karaoke app, with a same-origin /api/search
-route that finds a matching YouTube video and optionally auto-detects the
-lyric sync offset from that video's captions.
+"""Static file server for the karaoke app.
 
-Both steps talk to YouTube directly through maintained libraries rather
-than third-party Piped mirrors, which failed in nearly every way possible
+/api/search  finds a matching YouTube video for a text query.
+/api/captions returns that video's raw caption cue timing (start/end/text)
+             so the client can align each lyric line to its own best-
+             matching cue, rather than a single global offset.
+
+Both talk to YouTube directly through maintained libraries rather than
+third-party Piped mirrors, which failed in nearly every way possible
 during development: dead instances, CORS blocks, 500s, empty instance
 lists, DNS failures. Requires:
     pip install -r requirements.txt
@@ -13,7 +16,6 @@ Run with: python3 server.py [port]
 """
 import concurrent.futures
 import json
-import re
 import sys
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +26,6 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 # loading, no matter how the library or YouTube's response behaves.
 SEARCH_TIMEOUT = 15
 CAPTIONS_TIMEOUT = 10
-WORD_RE = re.compile(r"[a-z0-9']+")
 # A catch-all for whatever unexpected shape of error these external
 # libraries or a malformed request might raise — none of it should ever be
 # able to crash the request handler and leave the browser with no response.
@@ -79,40 +80,22 @@ def find_video(query):
         pool.shutdown(wait=False)
 
 
-def normalize_words(text):
-    return set(WORD_RE.findall(text.lower()))
-
-
-def find_caption_offset(cues, first_line_text, first_line_time):
-    """Find the first caption cue that shares words with the first lyric
-    line, and return the offset needed to align them, or None."""
-    target_words = normalize_words(first_line_text)
-    if not target_words:
-        return None
-    required_overlap = 2 if len(target_words) >= 2 else 1
-
-    for cue in cues:
-        overlap = target_words & normalize_words(cue['text'])
-        if len(overlap) >= required_overlap:
-            return first_line_time - cue['time']
-    return None
-
-
 def _fetch_transcript_cues(video_id):
     """Runs in a worker thread — see get_youtube_caption_cues for the
-    timeout wrapper. Only used for timing/word-overlap matching against
-    the already-licensed lyrics text from LRCLIB; the transcript text
-    itself is never shown to the user."""
+    timeout wrapper. Cue timing is used client-side to align each lyric
+    line to its own best-matching cue; the transcript text itself is
+    never shown to the user — displayed lyrics come from LRCLIB."""
     from youtube_transcript_api import YouTubeTranscriptApi
 
     try:
         # Newer versions of the library are instance-based.
         fetched = YouTubeTranscriptApi().fetch(video_id, languages=['en', 'en-US', 'en-GB'])
-        return [{'time': s.start, 'text': s.text} for s in fetched]
+        return [{'start': s.start, 'end': s.start + s.duration, 'text': s.text} for s in fetched]
     except AttributeError:
         # Older versions only expose the static method.
         raw = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
-        return [{'time': item['start'], 'text': item['text']} for item in raw]
+        return [{'start': item['start'], 'end': item['start'] + item['duration'], 'text': item['text']}
+                for item in raw]
 
 
 def get_youtube_caption_cues(video_id):
@@ -141,25 +124,14 @@ def get_youtube_caption_cues(video_id):
     return cues, None
 
 
-def get_suggested_offset(video_id, first_line_text, first_line_time):
-    cues, error = get_youtube_caption_cues(video_id)
-    if error:
-        print(f'Caption auto-sync: {error}')
-        return None
-
-    offset = find_caption_offset(cues, first_line_text, first_line_time)
-    if offset is not None:
-        print(f'Caption auto-sync: matched cue, offset={offset:.2f}s')
-    else:
-        print(f'Caption auto-sync: got {len(cues)} caption cue(s), none matched the first lyric line')
-    return offset
-
-
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == '/api/search':
             self.handle_search(parsed.query)
+            return
+        if parsed.path == '/api/captions':
+            self.handle_captions(parsed.query)
             return
         super().do_GET()
 
@@ -170,23 +142,36 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(400, 'Missing q parameter')
             return
 
-        # No matter what unexpected thing an external library throws at us,
-        # this endpoint must always respond — a crash here means the browser
-        # gets no HTTP response at all (ERR_EMPTY_RESPONSE) and the video
-        # never loads, which is worse than just reporting "not found".
-        video_url = video_id = None
-        suggested_offset = None
+        # No matter what unexpected thing yt-dlp throws at us, this endpoint
+        # must always respond — a crash here means the browser gets no HTTP
+        # response at all (ERR_EMPTY_RESPONSE) and the video never loads.
+        video_url = None
         try:
-            video_url, video_id = find_video(query)
-
-            first_line = params.get('first_line', [''])[0]
-            first_line_time = params.get('first_line_time', [''])[0]
-            if video_url and first_line and first_line_time:
-                suggested_offset = get_suggested_offset(video_id, first_line, float(first_line_time))
+            video_url, _ = find_video(query)
         except EXTERNAL_API_ERRORS as e:
             print(f'/api/search failed unexpectedly, returning empty result: {e}')
 
-        body = json.dumps({'url': video_url, 'suggestedOffset': suggested_offset}).encode()
+        self._send_json({'url': video_url})
+
+    def handle_captions(self, query_string):
+        params = urllib.parse.parse_qs(query_string)
+        video_id = params.get('v', [''])[0]
+        if not video_id:
+            self.send_error(400, 'Missing v parameter')
+            return
+
+        cues = None
+        error = None
+        try:
+            cues, error = get_youtube_caption_cues(video_id)
+        except EXTERNAL_API_ERRORS as e:
+            error = f'{type(e).__name__}: {e}'
+            print(f'/api/captions failed unexpectedly: {error}')
+
+        self._send_json({'cues': cues, 'error': error})
+
+    def _send_json(self, data):
+        body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
