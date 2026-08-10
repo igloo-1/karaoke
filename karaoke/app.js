@@ -259,20 +259,29 @@ function wordOverlapScore(wordsA, wordsB) {
     return intersection / union; // Jaccard similarity
 }
 
+// Short lines (a single interjection, etc.) are exactly the kind of text
+// that spuriously matches almost any nearby cue sharing that one word —
+// including a caption cue sitting inside an instrumental gap where an
+// ad-lib or background sound got auto-transcribed. Require a much higher
+// score for them.
+const SHORT_LINE_WORD_COUNT = 2;
+const SHORT_LINE_MIN_SCORE = 0.66;
+// A genuine match should track the LRC's own internal timing fairly
+// consistently; if a candidate's (cue time - LRC time) offset deviates
+// from the pack by more than this, it's almost always a false positive
+// rather than the video genuinely restructuring the song by that much.
+const OFFSET_OUTLIER_TOLERANCE = 20;
+
 // For each lyric line, find the caption cue with the closest wording
-// (highest word-overlap score), keeping it only if the score clears a
-// minimum confidence bar and it doesn't jump backwards in time relative
-// to the previous accepted match (more likely a false positive than a
-// real reordering).
-function alignLyricsToCaptions(lyrics, cues) {
-    const sortedCues = [...cues].sort((a, b) => a.start - b.start);
-    const cueWordSets = sortedCues.map(c => normalizeWords(c.text));
-
-    const aligned = new Array(lyrics.length).fill(null);
-    let lastStart = -Infinity;
-
-    lyrics.forEach((line, i) => {
+// (highest word-overlap score) — this is pass 1, considered independently
+// per line with no positional constraint yet.
+function findBestCaptionMatches(lyrics, sortedCues, cueWordSets) {
+    return lyrics.map((line) => {
         const lineWords = normalizeWords(line.text);
+        const requiredScore = lineWords.size <= SHORT_LINE_WORD_COUNT
+            ? SHORT_LINE_MIN_SCORE
+            : MIN_CAPTION_MATCH_SCORE;
+
         let bestIdx = -1;
         let bestScore = 0;
         for (let c = 0; c < sortedCues.length; c++) {
@@ -282,13 +291,35 @@ function alignLyricsToCaptions(lyrics, cues) {
                 bestIdx = c;
             }
         }
-        if (bestIdx === -1 || bestScore < MIN_CAPTION_MATCH_SCORE) return;
+        return (bestIdx === -1 || bestScore < requiredScore) ? null : sortedCues[bestIdx];
+    });
+}
 
-        const cue = sortedCues[bestIdx];
-        if (cue.start >= lastStart) {
-            aligned[i] = { start: cue.start, end: cue.end };
-            lastStart = cue.start;
-        }
+function alignLyricsToCaptions(lyrics, cues) {
+    const sortedCues = [...cues].sort((a, b) => a.start - b.start);
+    const cueWordSets = sortedCues.map(c => normalizeWords(c.text));
+    const candidates = findBestCaptionMatches(lyrics, sortedCues, cueWordSets);
+
+    // Pass 2: reject outliers whose implied offset from the LRC's own
+    // timing is way off from the rest — catches the false-positive case
+    // above without needing to know in advance which line it'll hit.
+    const offsets = [];
+    candidates.forEach((c, i) => { if (c) offsets.push(c.start - lyrics[i].time); });
+    if (offsets.length === 0) return new Array(lyrics.length).fill(null);
+    offsets.sort((a, b) => a - b);
+    const medianOffset = offsets[Math.floor(offsets.length / 2)];
+
+    // Pass 3: enforce chronological order on what survives — a match that
+    // jumps backwards relative to the previous accepted one is more likely
+    // a false positive than a real reordering.
+    const aligned = new Array(lyrics.length).fill(null);
+    let lastStart = -Infinity;
+    candidates.forEach((cue, i) => {
+        if (!cue) return;
+        if (Math.abs((cue.start - lyrics[i].time) - medianOffset) > OFFSET_OUTLIER_TOLERANCE) return;
+        if (cue.start < lastStart) return;
+        aligned[i] = { start: cue.start, end: cue.end };
+        lastStart = cue.start;
     });
 
     return aligned;
