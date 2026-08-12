@@ -24,6 +24,7 @@
                 <div id="video-container">
                     <div id="youtube-player"></div>
                 </div>
+                <div id="click-layer"></div>
                 <div id="lyrics-overlay">
                     <div id="lyrics-container">
                         <div id="lyrics-prev" class="lyrics-line lyrics-dim"></div>
@@ -31,10 +32,28 @@
                         <div id="lyrics-next" class="lyrics-line lyrics-dim"></div>
                     </div>
                 </div>
+                <div id="player-bar">
+                    <button id="play-btn" aria-label="Play/pause">▶</button>
+                    <span id="time-current" class="time">0:00</span>
+                    <div id="seek" role="slider" aria-label="Seek" tabindex="0">
+                        <div id="seek-track">
+                            <div id="seek-buffer"></div>
+                            <div id="seek-played"></div>
+                        </div>
+                        <div id="seek-handle"></div>
+                    </div>
+                    <span id="time-total" class="time">0:00</span>
+                    <button id="mute-btn" aria-label="Mute">🔊</button>
+                    <input type="range" id="volume" min="0" max="100" value="100" aria-label="Volume">
+                    <button id="fullscreen-btn" aria-label="Fullscreen">⛶</button>
+                </div>
             </div>
             <div id="controls">
+                <div id="sync-progress" class="hidden">
+                    <div id="sync-progress-bar"></div>
+                </div>
+                <span id="sync-status"></span>
                 <button id="tap-sync-btn">Tap when singing starts</button>
-                <button id="fullscreen-btn">⛶ Fullscreen</button>
                 <label>
                     Sync Offset:
                     <input type="range" id="offset-slider" min="-30" max="30" step="0.1" value="0">

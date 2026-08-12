@@ -203,17 +203,155 @@ body {
     height: 100%;
 }
 
-/* ── Lyrics Overlay ── */
+/* ── Player Controls ── */
 
-#lyrics-overlay {
+/* Catches clicks before the iframe does, so play/pause is ours rather than
+   YouTube's — its own chrome is switched off. */
+#click-layer {
+    position: absolute;
+    inset: 0;
+    cursor: pointer;
+}
+
+#player-bar {
     position: absolute;
     bottom: 0;
     left: 0;
     right: 0;
-    padding: 20px 15px;
-    background: linear-gradient(transparent, rgba(0,0,0,0.85) 30%);
-    pointer-events: none;
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px 12px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.9) 55%);
     border-radius: 0 0 16px 16px;
+    opacity: 1;
+    transition: opacity 0.35s;
+}
+
+/* Out of the way while singing, back the moment the mouse moves. */
+#stage.idle #player-bar {
+    opacity: 0;
+    pointer-events: none;
+}
+
+#stage.idle #click-layer {
+    cursor: none;
+}
+
+#player-bar button {
+    flex: none;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: #fff;
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.15s;
+}
+
+#player-bar button:hover {
+    background: rgba(255, 255, 255, 0.16);
+    transform: scale(1.08);
+}
+
+#play-btn {
+    font-size: 1.1rem;
+}
+
+.time {
+    flex: none;
+    color: #ddd;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 38px;
+    text-align: center;
+}
+
+#seek {
+    position: relative;
+    flex: 1;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    touch-action: none;
+}
+
+#seek-track {
+    position: relative;
+    width: 100%;
+    height: 5px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.25);
+    overflow: hidden;
+    transition: height 0.15s;
+}
+
+#seek:hover #seek-track,
+#seek.scrubbing #seek-track {
+    height: 8px;
+}
+
+#seek-buffer,
+#seek-played {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 0%;
+}
+
+#seek-buffer {
+    background: rgba(255, 255, 255, 0.28);
+}
+
+#seek-played {
+    background: linear-gradient(90deg, #a855f7, #f5c842);
+}
+
+#seek-handle {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    width: 13px;
+    height: 13px;
+    margin-left: -6.5px;
+    border-radius: 50%;
+    background: #fff;
+    transform: translateY(-50%) scale(0);
+    transition: transform 0.15s;
+    pointer-events: none;
+}
+
+#seek:hover #seek-handle,
+#seek.scrubbing #seek-handle {
+    transform: translateY(-50%) scale(1);
+}
+
+#volume {
+    flex: none;
+    width: 80px;
+    accent-color: #a855f7;
+    cursor: pointer;
+}
+
+/* ── Lyrics Overlay ── */
+
+#lyrics-overlay {
+    position: absolute;
+    /* Clear of the control bar, so the last line is never hidden behind it. */
+    bottom: 52px;
+    left: 0;
+    right: 0;
+    padding: 20px 15px 6px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.8) 40%);
+    pointer-events: none;
+    z-index: 2;
 }
 
 #lyrics-container {
@@ -287,6 +425,53 @@ body {
     align-items: center;
     gap: 20px;
     padding: 10px 0;
+    /* The sync messages appear and disappear, so let the row rewrap on narrow
+       screens instead of overflowing. */
+    flex-wrap: wrap;
+}
+
+#sync-progress {
+    width: 120px;
+    height: 5px;
+    border-radius: 3px;
+    background: #252535;
+    overflow: hidden;
+}
+
+#sync-progress-bar {
+    width: 0%;
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, #a855f7, #f5c842);
+    /* Progress arrives once a second, so ease between readings rather than
+       stepping — a bar that jumps looks stalled between updates. */
+    transition: width 0.9s linear;
+}
+
+#sync-status {
+    color: #888;
+    font-size: 0.85rem;
+    /* Never wrap: the messages are long enough to take a second line, which
+       shoves the whole control row around as they come and go. */
+    white-space: nowrap;
+    text-align: right;
+    transition: color 0.3s;
+}
+
+#sync-status.working::after {
+    content: '';
+    animation: sync-ellipsis 1.5s steps(4, end) infinite;
+}
+
+#sync-status.done {
+    color: #f5c842;
+}
+
+@keyframes sync-ellipsis {
+    0%   { content: ''; }
+    25%  { content: '.'; }
+    50%  { content: '..'; }
+    75%  { content: '...'; }
 }
 
 #tap-sync-btn {

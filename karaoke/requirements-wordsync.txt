@@ -1,0 +1,23 @@
+# Optional: local word-level timing for the fill animation.
+#
+# Without these the app still works — it paces words from YouTube's own caption
+# word timings, which exist for roughly a third of songs. With them, the server
+# transcribes each song itself and paces nearly all of them.
+#
+# This is a large install (~3 GB). It runs on CPU or an NVIDIA GPU, and picks
+# a Whisper model to suit — measured on a 3.5 minute song:
+#
+#     RTX 3080   ~40s per song   ('medium', ~98% of lines paced)
+#     16-core CPU ~4 min per song ('small', similar coverage)
+#
+# Either way it happens once per song in the background and is then cached, so
+# CPU is workable — just warm up songs before a session rather than during one.
+#
+# For GPU, install the CUDA build of torch first, matching your driver, e.g.
+#     pip install --index-url https://download.pytorch.org/whl/cu126 torch torchaudio
+# For CPU-only, plain `pip install torch` is enough. Then:
+#     pip install -r requirements-wordsync.txt
+#
+# ffmpeg must also be on PATH.
+demucs
+faster-whisper
